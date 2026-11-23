@@ -58,6 +58,11 @@ button:disabled{opacity:.4;cursor:default}
 .camBox canvas{display:block;touch-action:auto}
 .camBox.calib canvas{touch-action:none}
 .camMsg{position:absolute;color:#e9dccb;font-size:14px}
+.viewBtn{position:absolute;top:8px;right:8px;background:rgba(20,14,8,.62);color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:8px;padding:5px 10px;font-size:12.5px}
+.zoomRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.zoomRow span{font-size:13px;color:var(--muted);margin-right:4px}
+.zbtn{border:1px solid var(--border);background:#fff;border-radius:99px;padding:6px 11px;font-size:13.5px;font-weight:600}
+.zbtn.on{background:var(--ink);color:#fff;border-color:var(--ink)}
 .camBar{margin-top:10px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;font-size:14px;line-height:1.6}
 .camBar .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .camBar b{color:var(--accent)}
@@ -200,7 +205,7 @@ button:disabled{opacity:.4;cursor:default}
 
 <section id="stage" class="hidden">
   <div class="camCol">
-    <div class="camBox" id="camBox"><canvas id="cam"></canvas><div class="camMsg" id="camMsg">カメラを起動しています…</div></div>
+    <div class="camBox" id="camBox"><canvas id="cam"></canvas><div class="camMsg" id="camMsg">カメラを起動しています…</div><button id="viewBtn" class="viewBtn hidden">全体を表示</button></div>
     <div class="camBar" id="camBar"></div>
   </div>
   <div class="panel">
@@ -1054,7 +1059,7 @@ window.SHOGI_CHARS = [
   function saveStore(patch) { try { localStorage.setItem(LS, JSON.stringify(Object.assign(loadStore(), patch))); } catch (e) { /* 保存できない環境 */ } }
   const settings = Object.assign({
     handicap: 'hirate', side: 'sente', rank: '4k', voice: true, voiceSelf: true,
-    sens: 1, settle: 900, debug: false, deviceId: '', char: 'sota',
+    sens: 1, settle: 900, debug: false, deviceId: '', char: 'sota', zoom: 1, boardView: true,
   }, loadStore().settings || {});
   const saveSettings = () => saveStore({ settings });
 
@@ -1095,7 +1100,7 @@ window.SHOGI_CHARS = [
     mode: 'setup', // setup | calib | check | play
     noCam: false,
     stream: null,
-    corners: loadStore().corners || null, // 正規化座標 [左奥, 右奥, 右手前, 左手前]
+    corners: null, // 正規化座標 [左奥, 右奥, 右手前, 左手前]
     calibTaps: [], drag: -1, dragPt: null,
     humanSide: 0,
     game: null,
@@ -1345,26 +1350,73 @@ window.SHOGI_CHARS = [
     keepAwake();
     if (noCam) { enterPlay(); return; }
     $('setupMsg').textContent = '';
-    const ok = await startCamera(settings.deviceId);
+    const ok = await startCamera();
     if (!ok) { show('setup'); return; }
     S.resumeAfterCalib = !!resume;
     enterCalib();
   }
 
   // ================= カメラ =================
-  async function startCamera(deviceId) {
+  // ---- カメラ（レンズ選択とデジタルズーム） ----
+  // iPhone は「背面カメラ」「背面超広角カメラ」などのレンズが別カメラとして見える。
+  // 自動でレンズが切り替わる「デュアル/トリプル」は位置合わせがずれるので使わない。
+  function camKind(label) {
+    const l = label || '';
+    if (/前面|front|facetime|user/i.test(l)) return 'front';
+    if (/超広角|ultra\s*wide/i.test(l)) return 'ultra';
+    if (/デュアル|トリプル|dual|triple/i.test(l)) return 'virtual';
+    if (/望遠|tele/i.test(l)) return 'tele';
+    if (/背面|back|rear|environment/i.test(l)) return 'wide';
+    return 'other';
+  }
+  async function openStream(deviceId) {
+    if (S.stream) S.stream.getTracks().forEach((t) => t.stop());
+    const base = { width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } };
+    const sel = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
+    let st;
+    try { st = await navigator.mediaDevices.getUserMedia({ video: Object.assign({}, base, sel), audio: false }); }
+    catch (e) {
+      if (e && /Overconstrained|ConstraintNotSatisfied/.test(e.name || '')) st = await navigator.mediaDevices.getUserMedia({ video: sel, audio: false });
+      else throw e;
+    }
+    S.stream = st;
+    const tr = st.getVideoTracks()[0];
+    const set = (tr && tr.getSettings) ? tr.getSettings() : {};
+    S.curDeviceId = set.deviceId || deviceId || '';
+    S.curLabel = (tr && tr.label) || '';
+    video.srcObject = st;
+    await video.play().catch(() => {});
+    await new Promise((r) => { if (video.videoWidth) r(); else video.onloadedmetadata = () => r(); setTimeout(r, 4000); });
+  }
+  async function listCams() {
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+      S.cams = devs.map((d, i) => ({ id: d.deviceId, label: d.label || 'カメラ ' + (i + 1), kind: camKind(d.label) }));
+    } catch (e) { S.cams = []; }
+  }
+  const hasUltra = () => (S.cams || []).some((c) => c.kind === 'ultra');
+  // 「カメラの広さ」z（0.5=超広角, 1=ふつう）→ 使うレンズとデジタルズーム倍率
+  function lensFor(z) {
+    const cams = S.cams || [];
+    const ultra = cams.find((c) => c.kind === 'ultra'), wide = cams.find((c) => c.kind === 'wide');
+    const manual = settings.deviceId && cams.find((c) => c.id === settings.deviceId);
+    if (z < 1 && ultra && !(manual && manual.kind === 'front')) return { id: ultra.id, soft: z / 0.5 };
+    if (manual) return { id: manual.id, soft: manual.kind === 'ultra' ? Math.max(1, z / 0.5) : Math.max(1, z) };
+    if (wide) return { id: wide.id, soft: Math.max(1, z) };
+    return { id: S.curDeviceId || '', soft: Math.max(1, z) };
+  }
+  async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       $('setupMsg').textContent = 'このブラウザ/開き方ではカメラが使えません（https か、PCのChromeでファイルを開いてください）。';
       return false;
     }
     try {
-      if (S.stream) S.stream.getTracks().forEach((t) => t.stop());
-      const vc = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
-      Object.assign(vc, { width: { ideal: 1280 }, height: { ideal: 720 } });
-      S.stream = await navigator.mediaDevices.getUserMedia({ video: vc, audio: false });
-      video.srcObject = S.stream;
-      await video.play().catch(() => {});
-      await new Promise((r) => { if (video.videoWidth) r(); else video.onloadedmetadata = () => r(); setTimeout(r, 4000); });
+      await openStream(settings.deviceId || '');
+      await listCams();
+      if (!hasUltra() && settings.zoom < 1) settings.zoom = 1;
+      const L = lensFor(settings.zoom || 1);
+      if (L.id && L.id !== S.curDeviceId) await openStream(L.id);
+      S.softZoom = L.soft;
       fillCamList();
       $('camMsg').classList.add('hidden');
       layoutCam();
@@ -1374,29 +1426,57 @@ window.SHOGI_CHARS = [
       return false;
     }
   }
-  async function fillCamList() {
+  async function setZoom(z) {
+    if (S.zooming) return;
+    S.zooming = true;
     try {
-      const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
-      const sel = $('selCam');
-      sel.innerHTML = '<option value="">自動（スマホは背面カメラ）</option>' + devs.map((d, i) => `<option value="${esc(d.deviceId)}">${esc(d.label || 'カメラ ' + (i + 1))}</option>`).join('');
-      sel.value = settings.deviceId || '';
-      sel.onchange = () => { settings.deviceId = sel.value; saveSettings(); };
-      S.camDevices = devs;
-    } catch (e) { /* */ }
+      settings.zoom = z; saveSettings();
+      const L = lensFor(z);
+      if (L.id && L.id !== S.curDeviceId) {
+        await openStream(L.id);
+        S.calibTaps = []; S.corners = null; V.ready = false;
+        toast('レンズを切り替えました。盤の四隅をタップし直してください', 3200);
+      }
+      S.softZoom = L.soft;
+      layoutCam(); renderCamBar();
+    } catch (e) { toast('カメラを切り替えられませんでした'); }
+    finally { S.zooming = false; }
+  }
+  function fillCamList() {
+    const devs = S.cams || [];
+    const sel = $('selCam');
+    sel.innerHTML = '<option value="">自動（スマホは背面カメラ）</option>' + devs.map((d) => `<option value="${esc(d.id)}">${esc(d.label)}</option>`).join('');
+    sel.value = settings.deviceId || '';
+    sel.onchange = () => { settings.deviceId = sel.value; saveSettings(); };
+  }
+  // カメラ映像のうち画面に出す範囲（映像全体に対する 0〜1 の座標）
+  function viewRect() {
+    const vw = video.videoWidth || 1, vh = video.videoHeight || 1;
+    if ((S.mode === 'play' || S.mode === 'check') && S.corners && settings.boardView !== false) {
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const p of S.corners) { x0 = Math.min(x0, p.x * vw); y0 = Math.min(y0, p.y * vh); x1 = Math.max(x1, p.x * vw); y1 = Math.max(y1, p.y * vh); }
+      const pad = 0.07 * Math.max(x1 - x0, y1 - y0);
+      x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(vw, x1 + pad); y1 = Math.min(vh, y1 + pad);
+      if (x1 - x0 > 20 && y1 - y0 > 20) return { x: x0 / vw, y: y0 / vh, w: (x1 - x0) / vw, h: (y1 - y0) / vh };
+    }
+    const w = 1 / Math.max(1, S.softZoom || 1);
+    return { x: (1 - w) / 2, y: (1 - w) / 2, w, h: w };
   }
   function layoutCam() {
     if (!video.videoWidth) return;
     const box = $('camBox');
-    const aspect = video.videoWidth / video.videoHeight;
+    const r = viewRect();
+    const aspect = (r.w * video.videoWidth) / (r.h * video.videoHeight);
     const W = box.clientWidth || 640;
     const mobile = window.innerWidth <= 860;
-    const maxH = mobile ? window.innerHeight * 0.5 : window.innerHeight * 0.78;
+    const maxH = window.innerHeight * (mobile ? (S.mode === 'calib' ? 0.62 : 0.5) : 0.78);
     const dw = Math.min(W, maxH * aspect), dh = dw / aspect;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     cam.style.width = dw + 'px'; cam.style.height = dh + 'px';
     cam.width = Math.round(dw * dpr); cam.height = Math.round(dh * dpr);
-    S.camDpr = dpr;
+    S.camDpr = dpr; S.layoutKey = layoutKey();
   }
+  const layoutKey = () => { const r = viewRect(); return [S.mode, r.x.toFixed(3), r.y.toFixed(3), r.w.toFixed(3), r.h.toFixed(3), video.videoWidth, video.videoHeight].join(','); };
   window.addEventListener('resize', () => { layoutCam(); });
 
   // ================= 射影変換と画像処理 =================
@@ -1430,26 +1510,30 @@ window.SHOGI_CHARS = [
   function buildLUT() {
     V.ready = false;
     if (!S.corners || !video.videoWidth) return;
-    const vw = video.videoWidth, vh = video.videoHeight, sc = Math.min(1, 960 / vw);
+    const vw = video.videoWidth, vh = video.videoHeight;
     V.vw = vw; V.vh = vh;
-    V.PW = Math.round(vw * sc); V.PH = Math.round(vh * sc);
-    proc.width = V.PW; proc.height = V.PH;
     const H = homography(S.corners); V.H = H;
+    // 盤のまわりだけを元の解像度から切り出して処理する（超広角でも盤の解像度を保つ）
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    for (const p of S.corners) { x0 = Math.min(x0, p.x * V.PW); y0 = Math.min(y0, p.y * V.PH); x1 = Math.max(x1, p.x * V.PW); y1 = Math.max(y1, p.y * V.PH); }
-    V.bx = Math.max(0, Math.floor(x0) - 3); V.by = Math.max(0, Math.floor(y0) - 3);
-    V.bw = Math.min(V.PW, Math.ceil(x1) + 3) - V.bx; V.bh = Math.min(V.PH, Math.ceil(y1) + 3) - V.by;
-    if (V.bw < 20 || V.bh < 20) return;
+    for (const p of S.corners) { x0 = Math.min(x0, p.x * vw); y0 = Math.min(y0, p.y * vh); x1 = Math.max(x1, p.x * vw); y1 = Math.max(y1, p.y * vh); }
+    const pad = 0.03 * Math.max(x1 - x0, y1 - y0) + 4;
+    const sx = Math.max(0, Math.floor(x0 - pad)), sy = Math.max(0, Math.floor(y0 - pad));
+    const sw = Math.min(vw, Math.ceil(x1 + pad)) - sx, sh = Math.min(vh, Math.ceil(y1 + pad)) - sy;
+    if (sw < 40 || sh < 40) return;
+    const k = Math.min(1, 560 / Math.max(sw, sh));
+    V.src = { sx, sy, sw, sh }; V.k = k;
+    V.bx = 0; V.by = 0; V.bw = Math.max(20, Math.round(sw * k)); V.bh = Math.max(20, Math.round(sh * k));
+    proc.width = V.bw; proc.height = V.bh;
     V.idx = new Int32Array(81 * NP); V.fx = new Float32Array(81 * NP); V.fy = new Float32Array(81 * NP);
     for (let s = 0; s < 81; s++) {
       const [vr, vc] = viewRC(s);
       for (let j = 0; j < SS; j++) for (let i = 0; i < SS; i++) {
         const u = (vc + MARG + (1 - 2 * MARG) * (i + 0.5) / SS) / 9, v = (vr + MARG + (1 - 2 * MARG) * (j + 0.5) / SS) / 9;
         const [X, Y] = H(u, v);
-        let px = X * V.PW - V.bx - 0.5, py = Y * V.PH - V.by - 0.5;
+        let px = (X * vw - sx) * k - 0.5, py = (Y * vh - sy) * k - 0.5;
         px = Math.max(0, Math.min(V.bw - 1.001, px)); py = Math.max(0, Math.min(V.bh - 1.001, py));
-        const ix = Math.floor(px), iy = Math.floor(py), k = s * NP + j * SS + i;
-        V.idx[k] = iy * V.bw + ix; V.fx[k] = px - ix; V.fy[k] = py - iy;
+        const ix = Math.floor(px), iy = Math.floor(py), kk = s * NP + j * SS + i;
+        V.idx[kk] = iy * V.bw + ix; V.fx[kk] = px - ix; V.fy[kk] = py - iy;
       }
     }
     V.gray = new Float32Array(V.bw * V.bh + V.bw + 2);
@@ -1460,8 +1544,9 @@ window.SHOGI_CHARS = [
   }
 
   function grab() {
-    pctx.drawImage(video, 0, 0, V.PW, V.PH);
-    const data = pctx.getImageData(V.bx, V.by, V.bw, V.bh).data;
+    const r = V.src;
+    pctx.drawImage(video, r.sx, r.sy, r.sw, r.sh, 0, 0, V.bw, V.bh);
+    const data = pctx.getImageData(0, 0, V.bw, V.bh).data;
     const g = V.gray, n = V.bw * V.bh;
     for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (data[j] * 77 + data[j + 1] * 150 + data[j + 2] * 29) * 0.00390625;
     const out = V.pool[V.poolI]; V.poolI = (V.poolI + 1) % V.pool.length;
@@ -2139,6 +2224,7 @@ window.SHOGI_CHARS = [
   function enterCalib(fromPlay) {
     S.mode = 'calib';
     S.calibFromPlay = !!fromPlay;
+    if (!S.corners) { const st = loadStore(); if (st.corners && (!st.cornersCam || st.cornersCam === S.curLabel)) S.corners = st.corners; }
     S.calibTaps = S.corners ? S.corners.map((p) => ({ x: p.x, y: p.y })) : [];
     $('camBox').classList.add('calib');
     pill('位置合わせ', 'move');
@@ -2147,6 +2233,12 @@ window.SHOGI_CHARS = [
   function renderCamBar() {
     const bar = $('camBar');
     bar.classList.remove('tipOnly');
+    const vb = $('viewBtn');
+    if (vb) {
+      vb.classList.toggle('hidden', S.noCam || !(S.mode === 'play' || S.mode === 'check'));
+      vb.textContent = settings.boardView !== false ? '全体を表示' : '盤だけ表示';
+      vb.onclick = () => { settings.boardView = settings.boardView === false; saveSettings(); layoutCam(); renderCamBar(); };
+    }
     if (S.noCam) { bar.innerHTML = ''; return; }
     if (S.mode === 'calib') {
       const n = S.calibTaps.length;
@@ -2154,9 +2246,14 @@ window.SHOGI_CHARS = [
       const msg = n < 4
         ? `<b>あなたから見て${CORNER_NAMES[n]}</b>の角（9×9のマス目の外枠の角）をタップしてください。`
         : '格子が盤のマス目に重なっていればOK。ずれていたら丸い点をドラッグして調整します。';
-      bar.innerHTML = `<div>位置合わせ：盤の四隅を順にタップ</div><div class="steps">${steps}</div><div>${msg}</div>
-        <div class="row"><button class="ghost" id="cbReset">やり直す</button><button class="primary" id="cbOk" ${n < 4 ? 'disabled' : ''}>この位置でOK</button>${S.calibFromPlay ? '<button class="ghost" id="cbCancel">キャンセル</button>' : ''}</div>`;
+      const zs = [0.5, 0.7, 1, 1.5, 2], ul = hasUltra();
+      const zb = zs.map((z) => `<button class="zbtn${(settings.zoom || 1) === z ? ' on' : ''}" data-z="${z}" ${z < 1 && !ul ? 'disabled' : ''}>${z}×</button>`).join('');
+      const zoomHtml = `<div class="zoomRow"><span>カメラの広さ</span>${zb}</div>` +
+        (ul ? '<div class="hint">盤が入りきらないときは 0.7× や 0.5×（超広角）に。</div>' : '<div class="hint">0.5×・0.7× は超広角レンズのあるスマホ（iPhone 11以降など）で使えます。</div>');
+      bar.innerHTML = `${zoomHtml}<div style="margin-top:8px">位置合わせ：盤の四隅を順にタップ</div><div class="steps">${steps}</div><div>${msg}</div>
+        <div class="row"><button class="ghost" id="cbReset">やり直す</button><button class="primary" id="cbOk" ${n < 4 ? 'disabled' : ''}>この位置でOK</button>${S.calibFromPlay && S.corners ? '<button class="ghost" id="cbCancel">キャンセル</button>' : ''}</div>`;
       $('cbReset').onclick = () => { S.calibTaps = []; renderCamBar(); };
+      for (const b of bar.querySelectorAll('.zbtn')) b.onclick = () => setZoom(+b.dataset.z);
       $('cbOk').onclick = calibDone;
       if ($('cbCancel')) $('cbCancel').onclick = () => { S.mode = 'play'; $('camBox').classList.remove('calib'); renderAll(); };
     } else if (S.mode === 'check') {
@@ -2181,7 +2278,7 @@ window.SHOGI_CHARS = [
   function calibDone() {
     if (S.calibTaps.length < 4) return;
     S.corners = S.calibTaps.map((p) => ({ x: p.x, y: p.y }));
-    saveStore({ corners: S.corners });
+    saveStore({ corners: S.corners, cornersCam: S.curLabel || '' });
     $('camBox').classList.remove('calib');
     buildLUT();
     if (!V.ready) { toast('四隅の位置が正しくありません。もう一度タップしてください'); enterCalib(S.calibFromPlay); return; }
@@ -2212,13 +2309,18 @@ window.SHOGI_CHARS = [
   }
 
   // ポインタ操作（カメラ映像）
-  function camPoint(e) { const r = cam.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height, r }; }
+  // 画面上の位置 → 映像全体の座標
+  function camPoint(e) {
+    const r = cam.getBoundingClientRect(), v = viewRect();
+    const vx = (e.clientX - r.left) / r.width, vy = (e.clientY - r.top) / r.height;
+    return { x: v.x + vx * v.w, y: v.y + vy * v.h, r, v };
+  }
   cam.addEventListener('pointerdown', (e) => {
     if (S.mode !== 'calib') return;
     const p = camPoint(e);
     if (S.calibTaps.length === 4) {
       let bi = -1, bd = 1e9;
-      S.calibTaps.forEach((q, i) => { const d = Math.hypot((q.x - p.x) * p.r.width, (q.y - p.y) * p.r.height); if (d < bd) { bd = d; bi = i; } });
+      S.calibTaps.forEach((q, i) => { const d = Math.hypot((q.x - p.x) / p.v.w * p.r.width, (q.y - p.y) / p.v.h * p.r.height); if (d < bd) { bd = d; bi = i; } });
       if (bd < 44) { S.drag = bi; S.dragOff = { x: S.calibTaps[bi].x - p.x, y: S.calibTaps[bi].y - p.y }; cam.setPointerCapture(e.pointerId); e.preventDefault(); }
       return;
     }
@@ -2252,15 +2354,18 @@ window.SHOGI_CHARS = [
       layoutCam(); buildLUT();
       if (S.mode === 'play') enterResync('カメラの向きや解像度が変わりました。盤が画面の局面と同じなら［この盤面で再開］を押してください。');
     }
+    if (S.layoutKey !== layoutKey()) layoutCam();
     const W = cam.width, Hh = cam.height, k = S.camDpr || 1;
     if (!W) { layoutCam(); return; }
-    cctx.drawImage(video, 0, 0, W, Hh);
-    const P = (x, y) => [x * W, y * Hh];
+    const vr0 = viewRect(), vw0 = video.videoWidth, vh0 = video.videoHeight;
+    cctx.drawImage(video, vr0.x * vw0, vr0.y * vh0, vr0.w * vw0, vr0.h * vh0, 0, 0, W, Hh);
+    const toView = ([x, y]) => [(x - vr0.x) / vr0.w, (y - vr0.y) / vr0.h];
+    const P = (x, y) => { const [a, b] = toView([x, y]); return [a * W, b * Hh]; };
     if (S.mode === 'calib') {
       const t = S.calibTaps;
       cctx.lineWidth = 2 * k;
       if (t.length === 4) {
-        const H = homography(t);
+        const H0 = homography(t), H = (u, v) => toView(H0(u, v));
         cctx.strokeStyle = 'rgba(80,220,255,.85)'; cctx.lineWidth = 1.2 * k;
         cctx.beginPath();
         for (let i = 0; i <= 9; i++) {
@@ -2292,11 +2397,11 @@ window.SHOGI_CHARS = [
         cctx.fillText(String(i + 1), x, y + 0.5);
       });
       cctx.textBaseline = 'alphabetic';
-      if (S.drag >= 0 && t[S.drag]) drawLoupe(t[S.drag], W, Hh, k);
+      if (S.drag >= 0 && t[S.drag]) drawLoupe(t[S.drag], W, Hh, k, vr0);
       return;
     }
     if (!V.ready || !V.H) return;
-    const H = V.H;
+    const H = (u, v) => toView(V.H(u, v));
     const quad = (sq) => { const [vr, vc] = viewRC(sq); return [H(vc / 9, vr / 9), H((vc + 1) / 9, vr / 9), H((vc + 1) / 9, (vr + 1) / 9), H(vc / 9, (vr + 1) / 9)].map(([x, y]) => [x * W, y * Hh]); };
     const center = (sq) => { const [vr, vc] = viewRC(sq); const [x, y] = H((vc + 0.5) / 9, (vr + 0.5) / 9); return [x * W, y * Hh]; };
     const fillQuad = (sq, style) => { const q = quad(sq); cctx.fillStyle = style; cctx.beginPath(); q.forEach(([x, y], i) => (i ? cctx.lineTo(x, y) : cctx.moveTo(x, y))); cctx.closePath(); cctx.fill(); };
@@ -2360,11 +2465,11 @@ window.SHOGI_CHARS = [
     cctx.lineTo(x2 - Math.cos(a + 0.45) * 16 * k, y2 - Math.sin(a + 0.45) * 16 * k);
     cctx.closePath(); cctx.fill();
   }
-  function drawLoupe(q, W, Hh, k) {
+  function drawLoupe(q, W, Hh, k, vr) {
     const R = 58 * k, Z = 3;
-    const cx = q.x < 0.5 ? W - R - 10 * k : R + 10 * k, cy = R + 10 * k;
+    const cx = (q.x - vr.x) / vr.w < 0.5 ? W - R - 10 * k : R + 10 * k, cy = R + 10 * k;
     const vw = video.videoWidth, vh = video.videoHeight;
-    const sw = (2 * R / Z) * vw / W, sh = (2 * R / Z) * vh / Hh;
+    const sw = (2 * R / Z) * vr.w * vw / W, sh = (2 * R / Z) * vr.h * vh / Hh;
     cctx.save(); cctx.beginPath(); cctx.arc(cx, cy, R, 0, Math.PI * 2); cctx.clip();
     cctx.drawImage(video, q.x * vw - sw / 2, q.y * vh - sh / 2, sw, sh, cx - R, cy - R, 2 * R, 2 * R);
     cctx.restore();
@@ -2412,7 +2517,7 @@ window.SHOGI_CHARS = [
   requestAnimationFrame(loop);
 
   // テスト用フック
-  Object.assign(window.__cs, { evaluateNow, analyze, calibDone, beginPlay, resyncNow, homography, avgRing, buildLUT, setPhase });
+  Object.assign(window.__cs, { evaluateNow, analyze, calibDone, beginPlay, resyncNow, homography, avgRing, buildLUT, setPhase, viewRect, setZoom });
 
   initSetup();
 })();
